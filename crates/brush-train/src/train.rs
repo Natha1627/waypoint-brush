@@ -411,6 +411,73 @@ impl SplatTrainer {
         (splats, stats)
     }
 
+    /// Append externally seeded splats while preserving Adam momentum for the
+    /// splats that already exist (waypoint-brush addition).
+    ///
+    /// An incremental mapper seeds new gaussians a couple of times per second;
+    /// rebuilding the trainer on every batch throws away the optimizer state
+    /// for the whole map, so surfaces that were mid-convergence go soft after
+    /// each anchor. `Param::map` keeps the ParamId, which is what the Adam
+    /// record is keyed by — existing rows keep their moments, new rows start
+    /// at zero (exactly what a fresh Adam state would be).
+    ///
+    /// The per-splat refine record is dropped: its stats are only meaningful
+    /// between two refines and are regenerated lazily by the next step.
+    pub fn concat_splats(
+        &mut self,
+        mut splats: Splats,
+        new_transforms: Tensor<2>,
+        new_sh_coeffs: Tensor<3>,
+        new_raw_opacities: Tensor<1>,
+    ) -> Splats {
+        let n_new = new_transforms.dims()[0];
+        if n_new == 0 {
+            return splats;
+        }
+        // Per-splat state that no longer matches the new count.
+        self.refine_record = None;
+        // The 3D-filter floor is per-splat and training-only; recomputed at the
+        // next refine.
+        splats.min_scale = None;
+
+        let Some(optim) = self.optim.take() else {
+            // No optimizer state yet: a plain concat is exact.
+            splats.transforms = splats
+                .transforms
+                .map(|t| Tensor::cat(vec![t, new_transforms], 0).detach().require_grad());
+            splats.sh_coeffs = splats
+                .sh_coeffs
+                .map(|t| Tensor::cat(vec![t, new_sh_coeffs], 0).detach().require_grad());
+            splats.raw_opacities = splats
+                .raw_opacities
+                .map(|t| Tensor::cat(vec![t, new_raw_opacities], 0).detach().require_grad());
+            return splats;
+        };
+
+        let mut record = optim.to_record();
+        // Zero-pad `n_new` rows onto a moment tensor. Shape-agnostic on
+        // trailing dims: under `reduce_moment_2` the second moment may carry
+        // size-1 trailing dims, so the pad is built from the tensor's own dims.
+        fn pad_rows<const D: usize>(t: Tensor<D>, n_new: usize) -> Tensor<D> {
+            let mut dims = t.dims();
+            dims[0] = n_new;
+            let zeros = Tensor::zeros(dims, &t.device());
+            Tensor::cat(vec![t, zeros], 0)
+        }
+        let splats = map_splats_and_opt(
+            splats,
+            &mut record,
+            |t| Tensor::cat(vec![t, new_transforms], 0).detach().require_grad(),
+            |t| Tensor::cat(vec![t, new_sh_coeffs], 0).detach().require_grad(),
+            |t| Tensor::cat(vec![t, new_raw_opacities], 0).detach().require_grad(),
+            |m| pad_rows(m, n_new),
+            |m| pad_rows(m, n_new),
+            |m| pad_rows(m, n_new),
+        );
+        self.optim = Some(create_optimizer_from_config().load_record(record));
+        splats
+    }
+
     pub async fn refine(&mut self, iter: u32, splats: Splats) -> (Splats, RefineStats) {
         let progress = iter as f32 / self.config.total_train_iters.max(1) as f32;
         // Refine manipulates the canonical (un-floored) params, so bake the
