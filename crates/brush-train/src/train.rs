@@ -304,14 +304,29 @@ impl SplatTrainer {
                 let sh_lr_scales = Tensor::<1>::from_floats(scales.as_slice(), &opt_device)
                     .reshape([1, num_coeffs as i32, 1]);
 
-                create_optimizer_from_config().load_record(HashMap::from([(
+                let mut record = HashMap::from([(
                     splats.sh_coeffs.id,
                     AdaptorRecord::from_state(AdamState {
                         momentum: None,
                         scaling: Some(sh_lr_scales),
                         reduce_moment_2: true,
                     }),
-                )]))
+                )]);
+                if self.config.appearance_only {
+                    // Incremental concat/prune maps optimizer state for every
+                    // parameter. Geometry is intentionally never stepped in
+                    // this mode, but an empty typed record keeps those map
+                    // operations total without allocating Adam moments.
+                    record.insert(
+                        splats.transforms.id,
+                        AdaptorRecord::from_state(AdamState::<2> {
+                            momentum: None,
+                            scaling: None,
+                            reduce_moment_2: false,
+                        }),
+                    );
+                }
+                create_optimizer_from_config().load_record(record)
             });
 
         let lr_mean = self.sched_mean.step() * median_scale as f64;
