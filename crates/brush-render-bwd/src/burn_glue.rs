@@ -160,13 +160,15 @@ impl<B: Backend + SplatBwdOps> Backward<B, NUM_BWD_ARGS> for RenderBackwards {
             state.pass.geometry_grad(),
         );
 
-        if let Some(node) = transforms_parent {
-            grads.register::<B>(node.id, splat_grads.v_transforms);
-        }
+        if state.pass.geometry_grad() {
+            if let Some(node) = transforms_parent {
+                grads.register::<B>(node.id, splat_grads.v_transforms);
+            }
 
-        // v_refine_weight is already dense [num_points], written by the kernel.
-        if let Some(node) = refine_weight {
-            grads.register::<B>(node.id, splat_grads.v_refine_weight);
+            // v_refine_weight is dense [num_points] in the geometry pass.
+            if let Some(node) = refine_weight {
+                grads.register::<B>(node.id, splat_grads.v_refine_weight);
+            }
         }
 
         if let Some(node) = coeffs_parent {
@@ -507,6 +509,7 @@ impl SplatBwdOps for Fusion<MainBackendBase> {
 
         let client = transforms.client.clone();
         let num_points = transforms.shape[0];
+        let geometry_points = if geometry_grad { num_points } else { 1 };
         let coeffs = sh_coeffs_for_degree(project_uniforms.sh_degree) as usize;
 
         let input_tensors = [
@@ -520,7 +523,7 @@ impl SplatBwdOps for Fusion<MainBackendBase> {
         let outputs = {
             let v_transforms_out = TensorIr::uninit(
                 client.create_empty_handle(),
-                Shape::new([num_points, 10]),
+                Shape::new([geometry_points, 10]),
                 DType::F32,
             );
             let v_coeffs_out = TensorIr::uninit(
@@ -530,7 +533,7 @@ impl SplatBwdOps for Fusion<MainBackendBase> {
             );
             let v_raw_opac_out = TensorIr::uninit(
                 client.create_empty_handle(),
-                Shape::new([num_points]),
+                Shape::new([geometry_points]),
                 DType::F32,
             );
             let v_refine_weight_out = TensorIr::uninit(
