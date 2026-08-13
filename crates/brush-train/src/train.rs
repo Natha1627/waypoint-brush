@@ -14,7 +14,7 @@ use brush_loss::{ImageLossConfig, image_loss};
 use brush_render::gaussian_splats::RasterPass;
 use brush_render::gaussian_splats::Splats;
 use brush_render::{AlphaMode, bounding_box::BoundingBox, sh::sh_coeffs_for_degree};
-use brush_render_bwd::render_splats_with_pass;
+use brush_render_bwd::render_splats_with_frozen_prefix;
 use burn::{
     backend::wgpu::{AutoCompiler, WgpuDevice, WgpuRuntime},
     lr_scheduler::{
@@ -202,19 +202,21 @@ impl SplatTrainer {
         let (mut grads, visible, num_visible, loss_inner) = {
             // The splats already carry their 3D-filter floor (set at refine);
             // the render path folds it in. Optimizer/refine work on raw params.
-            let render_input = frozen_prefix.as_ref().map_or_else(
-                || splats.clone(),
-                |prefix| Splats::with_frozen_prefix(prefix, &splats),
-            );
             let pass = if self.config.appearance_only {
                 RasterPass::BackwardAppearance
             } else {
                 RasterPass::Backward
             };
-            let diff_out =
-                render_splats_with_pass(render_input, &camera, img_size, background, pass)
-                    .instrument(trace_span!("Forward"))
-                    .await;
+            let diff_out = render_splats_with_frozen_prefix(
+                splats.clone(),
+                frozen_prefix.as_ref(),
+                &camera,
+                img_size,
+                background,
+                pass,
+            )
+            .instrument(trace_span!("Forward"))
+            .await;
 
             let pred_image = diff_out.img;
             let refine_weight_holder = diff_out.refine_weight_holder;

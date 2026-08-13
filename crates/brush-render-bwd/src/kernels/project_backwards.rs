@@ -113,6 +113,7 @@ pub fn project_backwards_kernel(
     #[comptime] sh_degree: u32,
     #[comptime] camera_model: CameraModel,
     #[comptime] geometry_grad: bool,
+    gradient_start: u32,
 ) {
     let compact_gid = ABSOLUTE_POS as u32;
     if compact_gid >= u.num_visible {
@@ -120,6 +121,10 @@ pub fn project_backwards_kernel(
     }
 
     let global_gid = global_from_compact_gid[compact_gid as usize];
+    if global_gid < gradient_start {
+        terminate!();
+    }
+    let gradient_gid = global_gid - gradient_start;
 
     // Read upstream rasterize grads first. rasterize_bwd only writes for
     // splats that contributed to a pixel; non-contributing splats leave
@@ -158,7 +163,8 @@ pub fn project_backwards_kernel(
         transforms[tbase + 2],
     );
 
-    let coeff_base = global_gid * comptime![num_sh_coeffs(sh_degree) * 3u32];
+    let coeff_input_base = global_gid * comptime![num_sh_coeffs(sh_degree) * 3u32];
+    let coeff_output_base = gradient_gid * comptime![num_sh_coeffs(sh_degree) * 3u32];
     let v_color = Vec3A::new(v_color_r, v_color_g, v_color_b);
 
     // The live mapper uses SH0 and default (non-Mip) rendering. In its
@@ -169,7 +175,7 @@ pub fn project_backwards_kernel(
         if comptime![sh_degree == 0] {
             sh_coeffs_to_color_vjp(
                 v_coeffs,
-                coeff_base,
+                coeff_output_base,
                 sh_degree,
                 Vec3A::new(0.0f32, 0.0f32, 1.0f32),
                 v_color,
@@ -177,10 +183,10 @@ pub fn project_backwards_kernel(
         } else {
             let u_world = mean.sub(u.camera_pos());
             let v = u_world.scale(1.0f32 / u_world.length());
-            sh_coeffs_to_color_vjp(v_coeffs, coeff_base, sh_degree, v, v_color);
+            sh_coeffs_to_color_vjp(v_coeffs, coeff_output_base, sh_degree, v, v_color);
         }
         let opac_sig = sigmoid(raw_opac[global_gid as usize]);
-        v_raw_opac[global_gid as usize] = v_alpha_in * opac_sig * (1.0f32 - opac_sig);
+        v_raw_opac[gradient_gid as usize] = v_alpha_in * opac_sig * (1.0f32 - opac_sig);
         terminate!();
     }
 
@@ -193,8 +199,8 @@ pub fn project_backwards_kernel(
     let u_world = mean.sub(u.camera_pos());
     let u_len = u_world.length();
     let v = u_world.scale(1.0f32 / u_len);
-    sh_coeffs_to_color_vjp(v_coeffs, coeff_base, sh_degree, v, v_color);
-    let v_v_sh = sh_color_viewdir_vjp(sh_coeffs, coeff_base, sh_degree, v, v_color);
+    sh_coeffs_to_color_vjp(v_coeffs, coeff_output_base, sh_degree, v, v_color);
+    let v_v_sh = sh_color_viewdir_vjp(sh_coeffs, coeff_input_base, sh_degree, v, v_color);
     let v_dot_vv = v.dot(v_v_sh);
     let v_mean_from_sh = v_v_sh.sub(v.scale(v_dot_vv)).scale(1.0f32 / u_len);
 
@@ -206,12 +212,12 @@ pub fn project_backwards_kernel(
     let raw_cov = calc_cov2d(scale, quat, mean_c, u, camera_model);
     let (cov, filter_comp) = compensate_cov2d(raw_cov, mip_splatting);
     let opac_sig = sigmoid(raw_opac[global_gid as usize]);
-    v_raw_opac[global_gid as usize] = filter_comp * v_alpha_in * opac_sig * (1.0f32 - opac_sig);
+    v_raw_opac[gradient_gid as usize] = filter_comp * v_alpha_in * opac_sig * (1.0f32 - opac_sig);
 
     // Make sure to keep refine weight >= 0 and finite. Helps with super large degenerate splats
     // that sum up their refine weight to some massive value.
     let refine_clean = select(is_finite_f32(v_refine_in), v_refine_in, 0.0f32);
-    v_refine_weight[global_gid as usize] = clamp(refine_clean, 0.0f32, 1.0e32f32);
+    v_refine_weight[gradient_gid as usize] = clamp(refine_clean, 0.0f32, 1.0e32f32);
 
     // Appearance-only Mip rendering still needs the covariance-derived
     // opacity compensation above, but none of its geometry VJP below.
@@ -272,7 +278,7 @@ pub fn project_backwards_kernel(
     let v_q = apply_normalize_vjp(quat_unorm, q_grad);
 
     // Write gradients to dense v_transforms.
-    let vbase = (global_gid * 10u32) as usize;
+    let vbase = (gradient_gid * 10u32) as usize;
     v_transforms[vbase] = v_mean.x();
     v_transforms[vbase + 1] = v_mean.y();
     v_transforms[vbase + 2] = v_mean.z();

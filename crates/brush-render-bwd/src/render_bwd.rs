@@ -115,6 +115,7 @@ impl SplatBwdOps for MainBackendBase {
         render_mode: SplatRenderMode,
         v_combined: FloatTensor<Self>,
         geometry_grad: bool,
+        gradient_start: u32,
     ) -> SplatGrads<Self> {
         let _span = tracing::trace_span!("project_bwd").entered();
 
@@ -125,7 +126,7 @@ impl SplatBwdOps for MainBackendBase {
         let raw_opac = into_contiguous(raw_opac);
 
         let device = transforms.device.clone();
-        let num_points = transforms.shape()[0];
+        let num_points = transforms.shape()[0].saturating_sub(gradient_start as usize);
         let client = transforms.client.clone();
 
         // Dense outputs, the kernel scatters compact→global internally.
@@ -168,6 +169,7 @@ impl SplatBwdOps for MainBackendBase {
                 project_uniforms.sh_degree,
                 project_uniforms.camera_model,
                 geometry_grad,
+                gradient_start,
             );
         });
 

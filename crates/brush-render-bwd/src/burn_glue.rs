@@ -84,6 +84,7 @@ pub trait SplatBwdOps: SplatOps {
         render_mode: SplatRenderMode,
         v_combined: FloatTensor<Self>,
         geometry_grad: bool,
+        gradient_start: u32,
     ) -> SplatGrads<Self>;
 }
 
@@ -106,6 +107,7 @@ struct GaussianBackwardState<B: Backend> {
     pass: brush_render::gaussian_splats::RasterPass,
     background: Vec3,
     img_size: glam::UVec2,
+    gradient_start: u32,
 }
 
 #[derive(Debug)]
@@ -158,6 +160,7 @@ impl<B: Backend + SplatBwdOps> Backward<B, NUM_BWD_ARGS> for RenderBackwards {
             state.render_mode,
             rasterize_grads.v_combined,
             state.pass.geometry_grad(),
+            state.gradient_start,
         );
 
         if let Some(node) = transforms_parent {
@@ -245,7 +248,21 @@ pub async fn render_splats_with_pass(
     background: Vec3,
     pass: brush_render::gaussian_splats::RasterPass,
 ) -> SplatOutputDiff {
+    render_splats_with_frozen_prefix(splats, None, camera, img_size, background, pass).await
+}
+
+pub async fn render_splats_with_frozen_prefix(
+    splats: Splats,
+    frozen_prefix: Option<&Splats>,
+    camera: &Camera,
+    img_size: glam::UVec2,
+    background: Vec3,
+    pass: brush_render::gaussian_splats::RasterPass,
+) -> SplatOutputDiff {
     splats.clone().validate_values().await;
+    if let Some(prefix) = frozen_prefix {
+        prefix.clone().validate_values().await;
+    }
 
     let device = splats.device();
     assert!(
@@ -267,9 +284,10 @@ pub async fn render_splats_with_pass(
         None => (splats.transforms.val(), splats.raw_opacities.val()),
     };
 
-    let transforms_ad = unwrap_ad_wgpu_float(transforms_val);
-    let sh_coeffs_ad = unwrap_ad_wgpu_float(splats.sh_coeffs.val());
-    let raw_opac_ad = unwrap_ad_wgpu_float(raw_opac_val);
+    let sh_coeffs_val = splats.sh_coeffs.val();
+    let transforms_ad = unwrap_ad_wgpu_float(transforms_val.clone());
+    let sh_coeffs_ad = unwrap_ad_wgpu_float(sh_coeffs_val.clone());
+    let raw_opac_ad = unwrap_ad_wgpu_float(raw_opac_val.clone());
     let refine_weight_ad = unwrap_ad_wgpu_float(refine_weight_holder.clone());
 
     let prep_nodes = RenderBackwards
@@ -288,9 +306,32 @@ pub async fn render_splats_with_pass(
         SplatRenderMode::Default
     };
 
-    let transforms_inner: FloatTensor<MainBackend> = transforms_ad.primitive.clone();
-    let sh_inner: FloatTensor<MainBackend> = sh_coeffs_ad.primitive;
-    let raw_opac_inner: FloatTensor<MainBackend> = raw_opac_ad.primitive.clone();
+    let gradient_start = frozen_prefix.map_or(0, |prefix| prefix.num_splats());
+    let (transforms_inner, sh_inner, raw_opac_inner) = if let Some(prefix) = frozen_prefix {
+        (
+            unwrap_ad_wgpu_float(Tensor::cat(
+                vec![prefix.transforms.val().detach(), transforms_val],
+                0,
+            ))
+            .primitive,
+            unwrap_ad_wgpu_float(Tensor::cat(
+                vec![prefix.sh_coeffs.val().detach(), sh_coeffs_val],
+                0,
+            ))
+            .primitive,
+            unwrap_ad_wgpu_float(Tensor::cat(
+                vec![prefix.raw_opacities.val().detach(), raw_opac_val],
+                0,
+            ))
+            .primitive,
+        )
+    } else {
+        (
+            transforms_ad.primitive.clone(),
+            sh_coeffs_ad.primitive.clone(),
+            raw_opac_ad.primitive.clone(),
+        )
+    };
 
     assert!(
         pass.bwd_info(),
@@ -330,6 +371,7 @@ pub async fn render_splats_with_pass(
                 global_from_compact_gid: output.global_from_compact_gid,
                 background,
                 img_size,
+                gradient_start,
             };
             prep.finish(state, output.out_img)
         }
@@ -456,6 +498,7 @@ impl SplatBwdOps for Fusion<MainBackendBase> {
         render_mode: SplatRenderMode,
         v_combined: FloatTensor<Self>,
         geometry_grad: bool,
+        gradient_start: u32,
     ) -> SplatGrads<Self> {
         // The screen-area regulariser only acts in the backward kernel, so we
         // stamp the weight onto the uniforms here rather than in the forward.
@@ -465,6 +508,7 @@ impl SplatBwdOps for Fusion<MainBackendBase> {
             render_mode: SplatRenderMode,
             project_uniforms: ProjectUniforms,
             geometry_grad: bool,
+            gradient_start: u32,
         }
 
         impl Operation<FusionCubeRuntime<WgpuRuntime>> for CustomOp {
@@ -493,6 +537,7 @@ impl SplatBwdOps for Fusion<MainBackendBase> {
                     self.render_mode,
                     h.get_float_tensor::<MainBackendBase>(v_combined_in),
                     self.geometry_grad,
+                    self.gradient_start,
                 );
 
                 h.register_float_tensor::<MainBackendBase>(&v_transforms.id, grads.v_transforms);
@@ -506,7 +551,7 @@ impl SplatBwdOps for Fusion<MainBackendBase> {
         }
 
         let client = transforms.client.clone();
-        let num_points = transforms.shape[0];
+        let num_points = transforms.shape[0].saturating_sub(gradient_start as usize);
         let coeffs = sh_coeffs_for_degree(project_uniforms.sh_degree) as usize;
 
         let input_tensors = [
@@ -560,6 +605,7 @@ impl SplatBwdOps for Fusion<MainBackendBase> {
                         render_mode,
                         project_uniforms,
                         geometry_grad,
+                        gradient_start,
                     },
                 )
                 .outputs()
