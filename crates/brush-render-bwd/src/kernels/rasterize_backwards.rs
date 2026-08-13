@@ -107,6 +107,7 @@ pub fn rasterize_backwards_kernel<A: AtomicAddF32>(
     v_splats: &mut Tensor<Atomic<A::Storage>>,
     u: RasterizeUniforms,
     #[comptime] smooth_cutoff: bool,
+    #[comptime] geometry_grad: bool,
 ) {
     let (tile_id, tile_origin_x, tile_origin_y) = tile_origin(u.tile_bw);
     // Only `pix_state` lives in shared memory — it gets read-modify-
@@ -142,19 +143,22 @@ pub fn rasterize_backwards_kernel<A: AtomicAddF32>(
             v_output,
             u,
             smooth_cutoff,
+            geometry_grad,
         );
         if splat_active {
             let base = (compact_gid * 10u32) as usize;
-            A::add(&v_splats[base], grad.xy_x);
-            A::add(&v_splats[base + 1], grad.xy_y);
-            A::add(&v_splats[base + 2], grad.conic_x);
-            A::add(&v_splats[base + 3], grad.conic_y);
-            A::add(&v_splats[base + 4], grad.conic_z);
+            if comptime![geometry_grad] {
+                A::add(&v_splats[base], grad.xy_x);
+                A::add(&v_splats[base + 1], grad.xy_y);
+                A::add(&v_splats[base + 2], grad.conic_x);
+                A::add(&v_splats[base + 3], grad.conic_y);
+                A::add(&v_splats[base + 4], grad.conic_z);
+                A::add(&v_splats[base + 9], grad.refine);
+            }
             A::add(&v_splats[base + 5], grad.rgb_r);
             A::add(&v_splats[base + 6], grad.rgb_g);
             A::add(&v_splats[base + 7], grad.rgb_b);
             A::add(&v_splats[base + 8], grad.alpha);
-            A::add(&v_splats[base + 9], grad.refine);
         }
         batch_idx += 1u32;
     }
@@ -261,6 +265,7 @@ fn accumulate_grads_for_batch(
     v_output: &Tensor<f32>,
     u: RasterizeUniforms,
     #[comptime] smooth_cutoff: bool,
+    #[comptime] geometry_grad: bool,
 ) -> SplatGrad {
     let conic = Sym2 {
         c00: splat.conic_x,
@@ -353,26 +358,27 @@ fn accumulate_grads_for_batch(
                             0.0f32 * alpha
                         };
                         let v_alpha = v_alpha_eff * (w_cut + alpha * dw_dalpha);
-                        let v_sigma = -alpha * v_alpha;
-                        let vxy_x = v_sigma * (conic.c00 * dx + conic.c01 * dy);
-                        let vxy_y = v_sigma * (conic.c01 * dx + conic.c11 * dy);
-
                         // Suppress the alpha-saturated gradient term — at the
                         // cap the alpha derivative discontinuously flattens.
                         if splat.color_a * gaussian <= 0.999f32 {
-                            grad.conic_x += 0.5f32 * v_sigma * dx * dx;
-                            grad.conic_y += v_sigma * dx * dy;
-                            grad.conic_z += 0.5f32 * v_sigma * dy * dy;
-                            grad.xy_x += vxy_x;
-                            grad.xy_y += vxy_y;
                             grad.alpha += v_alpha * gaussian;
-                            let img_size_x = u.img_w as f32;
-                            let img_size_y = u.img_h as f32;
-                            let len = f32::sqrt(
-                                vxy_x * img_size_x * vxy_x * img_size_x
-                                    + vxy_y * img_size_y * vxy_y * img_size_y,
-                            );
-                            grad.refine += len / max(final_a, 1.0e-5f32);
+                            if comptime![geometry_grad] {
+                                let v_sigma = -alpha * v_alpha;
+                                let vxy_x = v_sigma * (conic.c00 * dx + conic.c01 * dy);
+                                let vxy_y = v_sigma * (conic.c01 * dx + conic.c11 * dy);
+                                grad.conic_x += 0.5f32 * v_sigma * dx * dx;
+                                grad.conic_y += v_sigma * dx * dy;
+                                grad.conic_z += 0.5f32 * v_sigma * dy * dy;
+                                grad.xy_x += vxy_x;
+                                grad.xy_y += vxy_y;
+                                let img_size_x = u.img_w as f32;
+                                let img_size_y = u.img_h as f32;
+                                let len = f32::sqrt(
+                                    vxy_x * img_size_x * vxy_x * img_size_x
+                                        + vxy_y * img_size_y * vxy_y * img_size_y,
+                                );
+                                grad.refine += len / max(final_a, 1.0e-5f32);
+                            }
                         }
 
                         pix_state[s] = new_remain_x;

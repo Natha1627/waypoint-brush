@@ -28,6 +28,7 @@ impl SplatBwdOps for MainBackendBase {
         img_size: glam::UVec2,
         v_output: FloatTensor<Self>,
         smooth_cutoff: bool,
+        geometry_grad: bool,
     ) -> RasterizeGrads<Self> {
         let _span = tracing::trace_span!("rasterize_bwd").entered();
 
@@ -81,6 +82,7 @@ impl SplatBwdOps for MainBackendBase {
                     v_combined.clone().into_tensor_arg(),
                     uniforms,
                     smooth_cutoff,
+                    geometry_grad,
                 );
             } else {
                 rasterize_backwards_kernel::launch::<CasAtomicAdd, WgpuRuntime>(
@@ -95,6 +97,7 @@ impl SplatBwdOps for MainBackendBase {
                     v_combined.clone().into_tensor_arg(),
                     uniforms,
                     smooth_cutoff,
+                    geometry_grad,
                 );
             }
         });

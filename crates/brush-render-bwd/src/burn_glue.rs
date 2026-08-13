@@ -66,6 +66,7 @@ pub trait SplatBwdOps: SplatOps {
         img_size: glam::UVec2,
         v_output: FloatTensor<Self>,
         smooth_cutoff: bool,
+        geometry_grad: bool,
     ) -> RasterizeGrads<Self>;
 
     /// Backward pass for projection.
@@ -145,6 +146,7 @@ impl<B: Backend + SplatBwdOps> Backward<B, NUM_BWD_ARGS> for RenderBackwards {
             state.img_size,
             v_output,
             state.pass.smooth_cutoff(),
+            state.pass.geometry_grad(),
         );
 
         let splat_grads = B::project_bwd(
@@ -357,6 +359,7 @@ impl SplatBwdOps for Fusion<MainBackendBase> {
         img_size: glam::UVec2,
         v_output: FloatTensor<Self>,
         smooth_cutoff: bool,
+        geometry_grad: bool,
     ) -> RasterizeGrads<Self> {
         #[derive(Debug)]
         struct CustomOp {
@@ -364,6 +367,7 @@ impl SplatBwdOps for Fusion<MainBackendBase> {
             background: Vec3,
             img_size: glam::UVec2,
             smooth_cutoff: bool,
+            geometry_grad: bool,
         }
 
         impl Operation<FusionCubeRuntime<WgpuRuntime>> for CustomOp {
@@ -392,6 +396,7 @@ impl SplatBwdOps for Fusion<MainBackendBase> {
                     self.img_size,
                     h.get_float_tensor::<MainBackendBase>(v_output),
                     self.smooth_cutoff,
+                    self.geometry_grad,
                 );
 
                 h.register_float_tensor::<MainBackendBase>(&v_combined.id, grads.v_combined);
@@ -429,6 +434,7 @@ impl SplatBwdOps for Fusion<MainBackendBase> {
                 background,
                 img_size,
                 smooth_cutoff,
+                geometry_grad,
             };
             client
                 .register(stream, OperationIr::Custom(desc), op)
