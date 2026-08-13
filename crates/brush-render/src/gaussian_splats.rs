@@ -119,6 +119,64 @@ pub fn fold_min_scale(
 }
 
 impl Splats {
+    /// Freeze every parameter while keeping the tensors on the same backend.
+    /// Unlike `valid()`, this deliberately does not move from autodiff to the
+    /// inner backend, so the result can be concatenated with a live trainable
+    /// tail without a backend crossing.
+    pub fn detach_params(self) -> Self {
+        let (transforms_id, transforms, _) = self.transforms.consume();
+        let (coeffs_id, coeffs, _) = self.sh_coeffs.consume();
+        let (opacity_id, opacity, _) = self.raw_opacities.consume();
+        Self {
+            transforms: Param::initialized(transforms_id, transforms.detach()),
+            sh_coeffs: Param::initialized(coeffs_id, coeffs.detach()),
+            raw_opacities: Param::initialized(opacity_id, opacity.detach()),
+            render_mip: self.render_mip,
+            min_scale: self.min_scale,
+        }
+    }
+
+    /// Build a render-only module containing a frozen prefix followed by the
+    /// trainable splats. The concatenation stays on the autodiff graph only
+    /// for `trainable`; backward therefore returns tail-sized gradients to its
+    /// parameters while the prefix still participates in depth sorting,
+    /// occlusion and colour compositing.
+    pub fn with_frozen_prefix(frozen: &Self, trainable: &Self) -> Self {
+        assert_eq!(
+            frozen.sh_coeffs.val().dims()[1],
+            trainable.sh_coeffs.val().dims()[1],
+            "frozen/trainable SH layouts must match"
+        );
+        Self {
+            transforms: Param::initialized(
+                ParamId::new(),
+                Tensor::cat(
+                    vec![frozen.transforms.val().detach(), trainable.transforms.val()],
+                    0,
+                ),
+            ),
+            sh_coeffs: Param::initialized(
+                ParamId::new(),
+                Tensor::cat(
+                    vec![frozen.sh_coeffs.val().detach(), trainable.sh_coeffs.val()],
+                    0,
+                ),
+            ),
+            raw_opacities: Param::initialized(
+                ParamId::new(),
+                Tensor::cat(
+                    vec![
+                        frozen.raw_opacities.val().detach(),
+                        trainable.raw_opacities.val(),
+                    ],
+                    0,
+                ),
+            ),
+            render_mip: trainable.render_mip,
+            min_scale: None,
+        }
+    }
+
     pub fn from_raw(
         pos_data: Vec<f32>,
         rot_data: Vec<f32>,

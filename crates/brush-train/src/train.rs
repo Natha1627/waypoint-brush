@@ -11,9 +11,9 @@ use crate::{
 };
 use brush_dataset::scene::SceneBatch;
 use brush_loss::{ImageLossConfig, image_loss};
+use brush_render::gaussian_splats::RasterPass;
 use brush_render::gaussian_splats::Splats;
 use brush_render::{AlphaMode, bounding_box::BoundingBox, sh::sh_coeffs_for_degree};
-use brush_render::gaussian_splats::RasterPass;
 use brush_render_bwd::render_splats_with_pass;
 use burn::{
     backend::wgpu::{AutoCompiler, WgpuDevice, WgpuRuntime},
@@ -156,6 +156,20 @@ impl SplatTrainer {
     }
 
     pub async fn step(&mut self, batch: SceneBatch, splats: Splats) -> (Splats, TrainStepStats) {
+        self.step_with_frozen_prefix(batch, splats, None).await
+    }
+
+    /// Train a bounded tail while rendering a frozen prefix in the same
+    /// globally depth-sorted pass. This is used by incremental mobile maps:
+    /// old surfaces remain visually and geometrically present, but Adam state
+    /// and parameter updates scale with recent trainable content rather than
+    /// the complete room/property.
+    pub async fn step_with_frozen_prefix(
+        &mut self,
+        batch: SceneBatch,
+        splats: Splats,
+        frozen_prefix: Option<Splats>,
+    ) -> (Splats, TrainStepStats) {
         let mut splats = splats;
 
         // Track max SH degree from the first splats we see.
@@ -188,15 +202,19 @@ impl SplatTrainer {
         let (mut grads, visible, num_visible, loss_inner) = {
             // The splats already carry their 3D-filter floor (set at refine);
             // the render path folds it in. Optimizer/refine work on raw params.
-            let render_input = splats.clone();
+            let render_input = frozen_prefix.as_ref().map_or_else(
+                || splats.clone(),
+                |prefix| Splats::with_frozen_prefix(prefix, &splats),
+            );
             let pass = if self.config.appearance_only {
                 RasterPass::BackwardAppearance
             } else {
                 RasterPass::Backward
             };
-            let diff_out = render_splats_with_pass(render_input, &camera, img_size, background, pass)
-                .instrument(trace_span!("Forward"))
-                .await;
+            let diff_out =
+                render_splats_with_pass(render_input, &camera, img_size, background, pass)
+                    .instrument(trace_span!("Forward"))
+                    .await;
 
             let pred_image = diff_out.img;
             let refine_weight_holder = diff_out.refine_weight_holder;
@@ -282,7 +300,11 @@ impl SplatTrainer {
                     // `visible` / `max_radius` already arrive on the inner backend;
                     // only the freshly-extracted `refine_weight` gradient needs the
                     // autodiff stripped off.
-                    record.gather_stats(detach_autodiff(refine_weight), visible.clone(), max_radius);
+                    record.gather_stats(
+                        detach_autodiff(refine_weight),
+                        visible.clone(),
+                        max_radius,
+                    );
                 });
             }
 
@@ -470,15 +492,21 @@ impl SplatTrainer {
 
         let Some(optim) = self.optim.take() else {
             // No optimizer state yet: a plain concat is exact.
-            splats.transforms = splats
-                .transforms
-                .map(|t| Tensor::cat(vec![t, new_transforms], 0).detach().require_grad());
-            splats.sh_coeffs = splats
-                .sh_coeffs
-                .map(|t| Tensor::cat(vec![t, new_sh_coeffs], 0).detach().require_grad());
-            splats.raw_opacities = splats
-                .raw_opacities
-                .map(|t| Tensor::cat(vec![t, new_raw_opacities], 0).detach().require_grad());
+            splats.transforms = splats.transforms.map(|t| {
+                Tensor::cat(vec![t, new_transforms], 0)
+                    .detach()
+                    .require_grad()
+            });
+            splats.sh_coeffs = splats.sh_coeffs.map(|t| {
+                Tensor::cat(vec![t, new_sh_coeffs], 0)
+                    .detach()
+                    .require_grad()
+            });
+            splats.raw_opacities = splats.raw_opacities.map(|t| {
+                Tensor::cat(vec![t, new_raw_opacities], 0)
+                    .detach()
+                    .require_grad()
+            });
             return splats;
         };
 
@@ -495,9 +523,21 @@ impl SplatTrainer {
         let splats = map_splats_and_opt(
             splats,
             &mut record,
-            |t| Tensor::cat(vec![t, new_transforms], 0).detach().require_grad(),
-            |t| Tensor::cat(vec![t, new_sh_coeffs], 0).detach().require_grad(),
-            |t| Tensor::cat(vec![t, new_raw_opacities], 0).detach().require_grad(),
+            |t| {
+                Tensor::cat(vec![t, new_transforms], 0)
+                    .detach()
+                    .require_grad()
+            },
+            |t| {
+                Tensor::cat(vec![t, new_sh_coeffs], 0)
+                    .detach()
+                    .require_grad()
+            },
+            |t| {
+                Tensor::cat(vec![t, new_raw_opacities], 0)
+                    .detach()
+                    .require_grad()
+            },
             |m| pad_rows(m, n_new),
             |m| pad_rows(m, n_new),
             |m| pad_rows(m, n_new),
