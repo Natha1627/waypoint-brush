@@ -13,7 +13,8 @@ use brush_dataset::scene::SceneBatch;
 use brush_loss::{ImageLossConfig, image_loss};
 use brush_render::gaussian_splats::Splats;
 use brush_render::{AlphaMode, bounding_box::BoundingBox, sh::sh_coeffs_for_degree};
-use brush_render_bwd::render_splats;
+use brush_render::gaussian_splats::RasterPass;
+use brush_render_bwd::render_splats_with_pass;
 use burn::{
     backend::wgpu::{AutoCompiler, WgpuDevice, WgpuRuntime},
     lr_scheduler::{
@@ -188,7 +189,12 @@ impl SplatTrainer {
             // The splats already carry their 3D-filter floor (set at refine);
             // the render path folds it in. Optimizer/refine work on raw params.
             let render_input = splats.clone();
-            let diff_out = render_splats(render_input, &camera, img_size, background)
+            let pass = if self.config.appearance_only {
+                RasterPass::BackwardAppearance
+            } else {
+                RasterPass::Backward
+            };
+            let diff_out = render_splats_with_pass(render_input, &camera, img_size, background, pass)
                 .instrument(trace_span!("Forward"))
                 .await;
 
@@ -315,7 +321,7 @@ impl SplatTrainer {
         // We use base_lr=1.0 and encode actual LRs in the scaling tensor.
         //
         // TODO: Ideally we don't have to do this every step... but idk as long as mean is on a schedule not much to do!
-        {
+        if !self.config.appearance_only {
             let lr_values: [f32; 10] = [
                 lr_mean as f32,
                 lr_mean as f32,
@@ -345,11 +351,13 @@ impl SplatTrainer {
         }
 
         splats = trace_span!("Optimizer step").in_scope(|| {
-            splats = trace_span!("Transforms step").in_scope(|| {
-                let grad_transforms =
-                    GradientsParams::from_params(&mut grads, &splats, &[splats.transforms.id]);
-                optimizer.step(1.0, splats, grad_transforms)
-            });
+            if !self.config.appearance_only {
+                splats = trace_span!("Transforms step").in_scope(|| {
+                    let grad_transforms =
+                        GradientsParams::from_params(&mut grads, &splats, &[splats.transforms.id]);
+                    optimizer.step(1.0, splats, grad_transforms)
+                });
+            }
             splats = trace_span!("SH Coeffs step").in_scope(|| {
                 let grad_coeff =
                     GradientsParams::from_params(&mut grads, &splats, &[splats.sh_coeffs.id]);
@@ -369,34 +377,37 @@ impl SplatTrainer {
         // the valid (inner) splats so the sigmoid never lands on the autodiff
         // graph, and `visible` is already inner — so nothing here builds a
         // node that won't get a backward pass.
-        let inv_opac: Tensor<1> = 1.0 - splats.valid().opacities();
-        let noise_weight = inv_opac.powi_scalar(150.0).clamp(0.0, 1.0) * visible;
-        let noise_weight = noise_weight.unsqueeze_dim(1);
-        // `samples` is pure data — keep it on the inner device so it can
-        // multiply with the `.inner()`-stripped `noise_weight` without
-        // crossing backends.
-        let samples = Tensor::random(
-            [splats.num_splats() as usize, 3],
-            Distribution::Normal(0.0, 1.0),
-            &splats.device().inner(),
-        );
+        if !self.config.appearance_only {
+            let inv_opac: Tensor<1> = 1.0 - splats.valid().opacities();
+            let noise_weight = inv_opac.powi_scalar(150.0).clamp(0.0, 1.0) * visible;
+            let noise_weight = noise_weight.unsqueeze_dim(1);
+            // `samples` is pure data — keep it on the inner device so it can
+            // multiply with the `.inner()`-stripped `noise_weight` without
+            // crossing backends.
+            let samples = Tensor::random(
+                [splats.num_splats() as usize, 3],
+                Distribution::Normal(0.0, 1.0),
+                &splats.device().inner(),
+            );
 
-        // Could scale by train time, but, the mean_lr already decays over time.
-        let noise_weight_means = noise_weight * (lr_mean as f32 * self.config.mean_noise_weight);
+            // Could scale by train time, but, the mean_lr already decays over time.
+            let noise_weight_means =
+                noise_weight * (lr_mean as f32 * self.config.mean_noise_weight);
 
-        // Add noise to the means portion (cols 0..3), and optionally scales
-        // (cols 7..10) and rotations (cols 3..7).
-        splats.transforms = splats.transforms.map(|t| {
-            // Only allow noised gaussians to travel at most the entire extent of the current bounds.
-            let noise_m = (samples * noise_weight_means).clamp(-median_scale, median_scale);
-            let inner = t.inner();
-            // slice + slice_assign with a clone of inner avoids holding two
-            // refs across slice_assign — `inner` is consumed by slice_assign
-            // and the resulting buffer is the only writer.
-            let noised_means = inner.clone().slice(s![.., 0..3]) + noise_m;
-            let out = inner.slice_assign(s![.., 0..3], noised_means);
-            Tensor::from_inner(out).require_grad()
-        });
+            // Add noise to the means portion (cols 0..3), and optionally scales
+            // (cols 7..10) and rotations (cols 3..7).
+            splats.transforms = splats.transforms.map(|t| {
+                // Only allow noised gaussians to travel at most the entire extent of the current bounds.
+                let noise_m = (samples * noise_weight_means).clamp(-median_scale, median_scale);
+                let inner = t.inner();
+                // slice + slice_assign with a clone of inner avoids holding two
+                // refs across slice_assign — `inner` is consumed by slice_assign
+                // and the resulting buffer is the only writer.
+                let noised_means = inner.clone().slice(s![.., 0..3]) + noise_m;
+                let out = inner.slice_assign(s![.., 0..3], noised_means);
+                Tensor::from_inner(out).require_grad()
+            });
+        }
 
         let stats = TrainStepStats {
             num_visible,

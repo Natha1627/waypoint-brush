@@ -111,6 +111,7 @@ impl SplatBwdOps for MainBackendBase {
         project_uniforms: ProjectUniforms,
         render_mode: SplatRenderMode,
         v_combined: FloatTensor<Self>,
+        geometry_grad: bool,
     ) -> SplatGrads<Self> {
         let _span = tracing::trace_span!("project_bwd").entered();
 
@@ -163,6 +164,7 @@ impl SplatBwdOps for MainBackendBase {
                 mip_splat,
                 project_uniforms.sh_degree,
                 project_uniforms.camera_model,
+                geometry_grad,
             );
         });
 

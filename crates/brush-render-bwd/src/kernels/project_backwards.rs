@@ -112,6 +112,7 @@ pub fn project_backwards_kernel(
     #[comptime] mip_splatting: bool,
     #[comptime] sh_degree: u32,
     #[comptime] camera_model: CameraModel,
+    #[comptime] geometry_grad: bool,
 ) {
     let compact_gid = ABSOLUTE_POS as u32;
     if compact_gid >= u.num_visible {
@@ -186,6 +187,15 @@ pub fn project_backwards_kernel(
     // that sum up their refine weight to some massive value.
     let refine_clean = select(is_finite_f32(v_refine_in), v_refine_in, 0.0f32);
     v_refine_weight[global_gid as usize] = clamp(refine_clean, 0.0f32, 1.0e32f32);
+
+    // Metric depth + surface normals can supply stable online geometry. In
+    // that mode colour and opacity still learn normally, but none of the
+    // screen-space/covariance VJP below is useful. This compile-time branch
+    // removes it from the generated mobile shader instead of merely applying
+    // a zero learning rate after paying for every gradient.
+    if comptime![!geometry_grad] {
+        terminate!();
+    }
 
     let conic_inv = cov.inverse();
     let v_inv = Sym2 {

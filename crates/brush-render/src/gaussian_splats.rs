@@ -32,6 +32,11 @@ pub enum RasterPass {
     Forward,
     /// Forward + backward bookkeeping (training). Hard cutoff.
     Backward,
+    /// Training backward for colour and opacity only. Projection still uses
+    /// the complete Gaussian geometry, but its expensive covariance/pose VJP
+    /// is omitted. Intended for online maps whose metric depth and normals
+    /// already define geometry.
+    BackwardAppearance,
     /// Backward + C^1 smoothstep around the alpha=1/255 cutoff. Test-only:
     /// makes the analytical backward agree with finite-diff at the cutoff,
     /// at the cost of a sub-1/255 forward shift on edge pixels.
@@ -44,6 +49,9 @@ impl RasterPass {
     }
     pub const fn smooth_cutoff(self) -> bool {
         matches!(self, Self::BackwardSmoothCutoff)
+    }
+    pub const fn geometry_grad(self) -> bool {
+        !matches!(self, Self::BackwardAppearance)
     }
 }
 

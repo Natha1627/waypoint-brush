@@ -82,6 +82,7 @@ pub trait SplatBwdOps: SplatOps {
         project_uniforms: ProjectUniforms,
         render_mode: SplatRenderMode,
         v_combined: FloatTensor<Self>,
+        geometry_grad: bool,
     ) -> SplatGrads<Self>;
 }
 
@@ -154,6 +155,7 @@ impl<B: Backend + SplatBwdOps> Backward<B, NUM_BWD_ARGS> for RenderBackwards {
             state.project_uniforms,
             state.render_mode,
             rasterize_grads.v_combined,
+            state.pass.geometry_grad(),
         );
 
         if let Some(node) = transforms_parent {
@@ -447,6 +449,7 @@ impl SplatBwdOps for Fusion<MainBackendBase> {
         project_uniforms: ProjectUniforms,
         render_mode: SplatRenderMode,
         v_combined: FloatTensor<Self>,
+        geometry_grad: bool,
     ) -> SplatGrads<Self> {
         // The screen-area regulariser only acts in the backward kernel, so we
         // stamp the weight onto the uniforms here rather than in the forward.
@@ -455,6 +458,7 @@ impl SplatBwdOps for Fusion<MainBackendBase> {
             desc: CustomOpIr,
             render_mode: SplatRenderMode,
             project_uniforms: ProjectUniforms,
+            geometry_grad: bool,
         }
 
         impl Operation<FusionCubeRuntime<WgpuRuntime>> for CustomOp {
@@ -482,6 +486,7 @@ impl SplatBwdOps for Fusion<MainBackendBase> {
                     self.project_uniforms,
                     self.render_mode,
                     h.get_float_tensor::<MainBackendBase>(v_combined_in),
+                    self.geometry_grad,
                 );
 
                 h.register_float_tensor::<MainBackendBase>(&v_transforms.id, grads.v_transforms);
@@ -548,6 +553,7 @@ impl SplatBwdOps for Fusion<MainBackendBase> {
                         desc,
                         render_mode,
                         project_uniforms,
+                        geometry_grad,
                     },
                 )
                 .outputs()

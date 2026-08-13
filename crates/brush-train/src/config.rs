@@ -12,6 +12,11 @@ pub struct TrainConfig {
     #[arg(long, help_heading = "Training options")]
     pub render_mode: Option<SplatRenderMode>,
 
+    /// Optimize only SH colour and opacity. The forward render is unchanged,
+    /// while the backward skips transforms and refine gradients.
+    #[arg(long, help_heading = "Training options", default_value = "false")]
+    pub appearance_only: bool,
+
     /// Start learning rate for the mean parameters.
     #[arg(long, help_heading = "Training options", default_value = "2e-5")]
     pub lr_mean: f64,
