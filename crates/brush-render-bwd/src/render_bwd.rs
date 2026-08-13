@@ -128,12 +128,8 @@ impl SplatBwdOps for MainBackendBase {
         let num_points = transforms.shape()[0];
         let client = transforms.client.clone();
 
-        // Geometry/refine outputs are never consumed in appearance-only mode.
-        // Use one-row sentinels rather than clearing 11*N floats every step;
-        // the compile-time kernel branch never writes them.
-        let geometry_points = if geometry_grad { num_points } else { 1 };
-        let v_transforms =
-            Self::float_zeros([geometry_points, 10].into(), &device, FloatDType::F32);
+        // Dense outputs, the kernel scatters compact→global internally.
+        let v_transforms = Self::float_zeros([num_points, 10].into(), &device, FloatDType::F32);
         let v_coeffs = Self::float_zeros(
             [
                 num_points,
@@ -145,8 +141,7 @@ impl SplatBwdOps for MainBackendBase {
             FloatDType::F32,
         );
         let v_raw_opac = Self::float_zeros([num_points].into(), &device, FloatDType::F32);
-        let v_refine_weight =
-            Self::float_zeros([geometry_points].into(), &device, FloatDType::F32);
+        let v_refine_weight = Self::float_zeros([num_points].into(), &device, FloatDType::F32);
 
         let mip_splat = matches!(render_mode, SplatRenderMode::Mip);
 
