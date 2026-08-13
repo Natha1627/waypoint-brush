@@ -157,6 +157,33 @@ pub fn project_backwards_kernel(
         transforms[tbase + 1],
         transforms[tbase + 2],
     );
+
+    let coeff_base = global_gid * comptime![num_sh_coeffs(sh_degree) * 3u32];
+    let v_color = Vec3A::new(v_color_r, v_color_g, v_color_b);
+
+    // The live mapper uses SH0 and default (non-Mip) rendering. In its
+    // appearance-only pass the SH basis is constant and opacity compensation
+    // is 1, so projection/covariance/quaternion/scale never need to be read.
+    // Keep the generic SH path for callers that opt into higher degrees.
+    if comptime![!geometry_grad && !mip_splatting] {
+        if comptime![sh_degree == 0] {
+            sh_coeffs_to_color_vjp(
+                v_coeffs,
+                coeff_base,
+                sh_degree,
+                Vec3A::new(0.0f32, 0.0f32, 1.0f32),
+                v_color,
+            );
+        } else {
+            let u_world = mean.sub(u.camera_pos());
+            let v = u_world.scale(1.0f32 / u_world.length());
+            sh_coeffs_to_color_vjp(v_coeffs, coeff_base, sh_degree, v, v_color);
+        }
+        let opac_sig = sigmoid(raw_opac[global_gid as usize]);
+        v_raw_opac[global_gid as usize] = v_alpha_in * opac_sig * (1.0f32 - opac_sig);
+        terminate!();
+    }
+
     let scale = read_scale(transforms, tbase);
     let quat_unorm = read_quat_unorm(transforms, tbase);
     let quat = quat_unorm.normalize();
@@ -166,8 +193,6 @@ pub fn project_backwards_kernel(
     let u_world = mean.sub(u.camera_pos());
     let u_len = u_world.length();
     let v = u_world.scale(1.0f32 / u_len);
-    let coeff_base = global_gid * comptime![num_sh_coeffs(sh_degree) * 3u32];
-    let v_color = Vec3A::new(v_color_r, v_color_g, v_color_b);
     sh_coeffs_to_color_vjp(v_coeffs, coeff_base, sh_degree, v, v_color);
     let v_v_sh = sh_color_viewdir_vjp(sh_coeffs, coeff_base, sh_degree, v, v_color);
     let v_dot_vv = v.dot(v_v_sh);
@@ -188,11 +213,8 @@ pub fn project_backwards_kernel(
     let refine_clean = select(is_finite_f32(v_refine_in), v_refine_in, 0.0f32);
     v_refine_weight[global_gid as usize] = clamp(refine_clean, 0.0f32, 1.0e32f32);
 
-    // Metric depth + surface normals can supply stable online geometry. In
-    // that mode colour and opacity still learn normally, but none of the
-    // screen-space/covariance VJP below is useful. This compile-time branch
-    // removes it from the generated mobile shader instead of merely applying
-    // a zero learning rate after paying for every gradient.
+    // Appearance-only Mip rendering still needs the covariance-derived
+    // opacity compensation above, but none of its geometry VJP below.
     if comptime![!geometry_grad] {
         terminate!();
     }
