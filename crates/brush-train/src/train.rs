@@ -264,25 +264,27 @@ impl SplatTrainer {
             let loss_inner = loss.clone().inner();
             let mut grads = splats.bwd_validate(loss).await;
 
-            trace_span!("Housekeeping").in_scope(|| {
-                // Refine state accumulates on the inner (non-autodiff) device
-                // so we can mix it with `.inner()`-stripped gradients/aux
-                // without crossing backends. `detach_autodiff` also clears
-                // the residual `checkpointing` flag that bare `.inner()`
-                // leaves behind (see `brush_render::burn_glue`).
-                use brush_render::burn_glue::detach_autodiff;
-                let refine_weight = refine_weight_holder
-                    .grad_remove(&mut grads)
-                    .expect("XY gradients need to be calculated.");
-                let device = splats.device().inner();
-                let record = self
-                    .refine_record
-                    .get_or_insert_with(|| RefineRecord::new(splats.num_splats(), &device));
-                // `visible` / `max_radius` already arrive on the inner backend;
-                // only the freshly-extracted `refine_weight` gradient needs the
-                // autodiff stripped off.
-                record.gather_stats(detach_autodiff(refine_weight), visible.clone(), max_radius);
-            });
+            if !self.config.appearance_only {
+                trace_span!("Housekeeping").in_scope(|| {
+                    // Refine state accumulates on the inner (non-autodiff) device
+                    // so we can mix it with `.inner()`-stripped gradients/aux
+                    // without crossing backends. `detach_autodiff` also clears
+                    // the residual `checkpointing` flag that bare `.inner()`
+                    // leaves behind (see `brush_render::burn_glue`).
+                    use brush_render::burn_glue::detach_autodiff;
+                    let refine_weight = refine_weight_holder
+                        .grad_remove(&mut grads)
+                        .expect("XY gradients need to be calculated.");
+                    let device = splats.device().inner();
+                    let record = self
+                        .refine_record
+                        .get_or_insert_with(|| RefineRecord::new(splats.num_splats(), &device));
+                    // `visible` / `max_radius` already arrive on the inner backend;
+                    // only the freshly-extracted `refine_weight` gradient needs the
+                    // autodiff stripped off.
+                    record.gather_stats(detach_autodiff(refine_weight), visible.clone(), max_radius);
+                });
+            }
 
             (grads, visible, diff_out.num_visible, loss_inner)
         };
